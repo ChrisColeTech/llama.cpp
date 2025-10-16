@@ -1,0 +1,17 @@
+{
+  "name": "llama-cpp-qwen-debug",
+  "version": "1.0.0",
+  "description": "Build and test scripts for Qwen3-Next DeltaNet debugging in llama.cpp",
+  "scripts": {
+    "test:crash": "powershell -ExecutionPolicy Bypass -File .\\reproduce-crash.ps1",
+    "test:crash-linux": "bash ./reproduce-crash.sh",
+    "build": "powershell -ExecutionPolicy Bypass -File .\\build.ps1",
+    "build:linux": "bash ./build-linux.sh",
+    "start": "powershell -ExecutionPolicy Bypass -File .\\start-server.ps1",
+    "test": "powershell -ExecutionPolicy Bypass -File .\\test-server.ps1",
+    "logs": "powershell -Command \"Get-Content C:\\Projects\\llama.cpp-v2\\logs\\server.log -Wait -Tail 50\"",
+    "logs:build": "powershell -Command \"Get-Content C:\\Projects\\llama.cpp-v2\\logs\\build.log -Wait -Tail 50\"",
+    "logs:build-linux": "tail -f /mnt/c/Projects/llama.cpp-v2/logs/build-linux.log",
+    "logs:crash": "powershell -Command \"Get-Content C:\\Projects\\llama.cpp-v2\\logs\\reproduce-crash.log -Tail 100\""
+  }
+}

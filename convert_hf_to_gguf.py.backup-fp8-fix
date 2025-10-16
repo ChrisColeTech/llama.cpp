@@ -276,97 +276,10 @@ class ModelBase:
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
 
-    def dequant_fp8_model(self) -> Iterator[tuple[str, Tensor]]:
-        """
-        Dequantize FP8 weights using weight_scale_inv tensors.
-
-        For models quantized with FP8, the weights are stored as FP8 values with
-        corresponding weight_scale_inv tensors that store the inverse scaling factors.
-
-        Formula: original_weight = fp8_weight * weight_scale_inv
-
-        This method:
-        1. Loads all tensors into memory
-        2. Separates FP8 weights and their corresponding weight_scale_inv tensors
-        3. Applies block-wise dequantization using the inverse scaling
-        4. Yields dequantized weights (and skips weight_scale_inv tensors)
-        """
-        # Check if this is an FP8 quantized model
-        quant_config = self.hparams.get("quantization_config", {})
-        if quant_config.get("quant_method") != "fp8":
-            # Not an FP8 model, pass through tensors unchanged
-            yield from self.get_tensors()
-            return
-
-        logger.info("gguf: FP8 quantization detected, dequantizing weights...")
-        weight_block_size = quant_config.get("weight_block_size", [128, 128])
-        logger.info(f"gguf: Using weight_block_size = {weight_block_size}")
-
-        # Load all tensors into memory (necessary to match weights with their scales)
-        all_tensors: dict[str, Tensor] = {}
-        for name, tensor in self.get_tensors():
-            all_tensors[name] = tensor
-
-        # Separate weights and scales
-        weight_scales: dict[str, Tensor] = {}
-        processed_tensors: set[str] = set()
-
-        # Find all weight_scale_inv tensors and map them to their weights
-        for name in all_tensors.keys():
-            if name.endswith(".weight_scale_inv"):
-                weight_name = name[:-len("_scale_inv")]
-                if weight_name in all_tensors:
-                    weight_scales[weight_name] = all_tensors[name]
-                    processed_tensors.add(name)  # Mark scale tensor for skipping
-                else:
-                    logger.warning(f"gguf: Found scale tensor {name} but no corresponding weight {weight_name}")
-
-        logger.info(f"gguf: Found {len(weight_scales)} FP8 weights with scales to dequantize")
-
-        # Process all tensors
-        for name, tensor in all_tensors.items():
-            # Skip weight_scale_inv tensors (they've been used above)
-            if name in processed_tensors:
-                logger.debug(f"gguf: Skipping scale tensor {name}")
-                continue
-
-            # Check if this weight has a corresponding scale
-            if name in weight_scales:
-                # This is an FP8 weight that needs dequantization
-                weight = tensor
-                scale_inv = weight_scales[name]
-
-                logger.info(f"gguf: Dequantizing FP8 weight {name}, shape={list(weight.shape)}, scale_inv shape={list(scale_inv.shape)}")
-
-                # Convert tensors to float32 for processing
-                weight_f32 = weight.to(torch.float32)
-                scale_inv_f32 = scale_inv.to(torch.float32)
-
-                # Handle block-wise scaling
-                # The scale_inv tensor may be smaller than the weight (block quantization)
-                # We need to expand it to match the weight dimensions
-                if weight_f32.shape != scale_inv_f32.shape:
-                    # Repeat the scale tensor to match weight dimensions
-                    # For block quantization [128, 128], each scale value applies to a 128x128 block
-                    for i, block_size in enumerate(weight_block_size):
-                        scale_inv_f32 = scale_inv_f32.repeat_interleave(block_size, dim=i)
-
-                    # Trim scale to match exact weight shape (handle padding)
-                    scale_inv_f32 = scale_inv_f32[tuple(slice(0, size) for size in weight_f32.shape)]
-
-                # Apply dequantization: original_weight = fp8_weight * scale_inv
-                dequantized_weight = weight_f32 * scale_inv_f32
-
-                logger.info(f"gguf: Dequantized {name} from {weight.dtype} to {dequantized_weight.dtype}")
-                yield (name, dequantized_weight)
-            else:
-                # Not an FP8 weight, pass through unchanged
-                yield (name, tensor)
-
     def prepare_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
 
-        for name, data_torch in chain(self.generate_extra_tensors(), self.dequant_fp8_model()):
+        for name, data_torch in chain(self.generate_extra_tensors(), self.get_tensors()):
             # we don't need these
             if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
                 continue

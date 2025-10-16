@@ -405,12 +405,47 @@ struct ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
     GGML_ASSERT(ggml_is_contiguous(state));
 
     const int64_t S_k = q->ne[0];
-    const int64_t H_k = q->ne[1];
+    int64_t H_k = q->ne[1];  // Non-const: will be updated after repeat if GQA
     const int64_t n_tokens = q->ne[2];
     const int64_t n_seqs = q->ne[3];
 
     const int64_t S_v = v->ne[0];
     const int64_t H_v = v->ne[1];
+
+    fprintf(stderr, "[delta_net_recurrent] Entry: S_k=%lld, H_k=%lld, S_v=%lld, H_v=%lld, n_tokens=%lld, n_seqs=%lld\n",
+            (long long)S_k, (long long)H_k, (long long)S_v, (long long)H_v, (long long)n_tokens, (long long)n_seqs);
+    fprintf(stderr, "[delta_net_recurrent] q dims: [%lld, %lld, %lld, %lld]\n",
+            (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2], (long long)q->ne[3]);
+    fprintf(stderr, "[delta_net_recurrent] k dims: [%lld, %lld, %lld, %lld]\n",
+            (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2], (long long)k->ne[3]);
+    fprintf(stderr, "[delta_net_recurrent] v dims: [%lld, %lld, %lld, %lld]\n",
+            (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3]);
+
+    // If num_k_heads != num_v_heads (GQA), repeat k and q to match the number of value heads
+    if (H_k != H_v) {
+        fprintf(stderr, "[delta_net_recurrent] GQA detected: H_k=%lld != H_v=%lld, applying repeat...\n",
+                (long long)H_k, (long long)H_v);
+        GGML_ASSERT(H_v % H_k == 0);
+        // Repeat q and k to match the number of v heads
+        // q: [S_k, H_k, n_tokens, n_seqs] -> [S_k, H_v, n_tokens, n_seqs]
+        q = ggml_repeat_4d(ctx, q, S_k, H_v, n_tokens, n_seqs);
+        cb(q, "q_repeated", il);
+
+        // k: [S_k, H_k, n_tokens, n_seqs] -> [S_k, H_v, n_tokens, n_seqs]
+        k = ggml_repeat_4d(ctx, k, S_k, H_v, n_tokens, n_seqs);
+        cb(k, "k_repeated", il);
+
+        // Update H_k to reflect the new head count after repeat
+        H_k = H_v;
+        fprintf(stderr, "[delta_net_recurrent] After repeat: H_k updated to %lld\n", (long long)H_k);
+        fprintf(stderr, "[delta_net_recurrent] q dims after repeat: [%lld, %lld, %lld, %lld]\n",
+                (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2], (long long)q->ne[3]);
+        fprintf(stderr, "[delta_net_recurrent] k dims after repeat: [%lld, %lld, %lld, %lld]\n",
+                (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2], (long long)k->ne[3]);
+    } else {
+        fprintf(stderr, "[delta_net_recurrent] No GQA repeat needed: H_k=%lld == H_v=%lld\n",
+                (long long)H_k, (long long)H_v);
+    }
 
     GGML_ASSERT(v->ne[2] == n_tokens);
     GGML_ASSERT(k->ne[2] == n_tokens);
@@ -418,10 +453,9 @@ struct ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
     GGML_ASSERT(beta->ne[0] == H_v && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * H_v && state->ne[2] == 1 && state->ne[3] == n_seqs);
 
-    GGML_ASSERT(q->ne[0] == S_k && q->ne[1] == H_k && q->ne[2] == n_tokens && q->ne[3] == n_seqs);
-    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == H_k && k->ne[2] == n_tokens && q->ne[3] == n_seqs);
-
-    GGML_ASSERT(H_k == H_v); // we did a repeat to make sure this is the case
+    // After repeat, these dimensions should match
+    GGML_ASSERT(q->ne[0] == S_k && q->ne[1] == H_v && q->ne[2] == n_tokens && q->ne[3] == n_seqs);
+    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == H_v && k->ne[2] == n_tokens && q->ne[3] == n_seqs);
 
     cb(q, "q_prenorm", il);
     cb(k, "k_prenorm", il);
@@ -458,13 +492,22 @@ struct ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
     g = ggml_cont(ctx, ggml_permute(ctx, g, 2, 0, 3, 1));
     cb(g, "g_permute", il);
 
+    fprintf(stderr, "[delta_net_recurrent] Creating token views with H_k=%lld, H_v=%lld\n", (long long)H_k, (long long)H_v);
     ggml_tensor * q_tokens = ggml_cont_4d(ctx, q, n_tokens, S_k, H_k, n_seqs);
+    fprintf(stderr, "[delta_net_recurrent] q_tokens: [%lld, %lld, %lld, %lld]\n",
+            (long long)q_tokens->ne[0], (long long)q_tokens->ne[1], (long long)q_tokens->ne[2], (long long)q_tokens->ne[3]);
     ggml_tensor * k_tokens = ggml_cont_4d(ctx, k, n_tokens, S_k, H_k, n_seqs);
-    ggml_tensor * v_tokens = ggml_cont_4d(ctx, v, n_tokens, S_v, H_k, n_seqs);
-    ggml_tensor * g_tokens = ggml_cont_4d(ctx, g, n_tokens, 1, H_k, n_seqs);
-    ggml_tensor * beta_tokens = ggml_cont_4d(ctx, beta, n_tokens, 1, H_k, n_seqs);
+    fprintf(stderr, "[delta_net_recurrent] k_tokens: [%lld, %lld, %lld, %lld]\n",
+            (long long)k_tokens->ne[0], (long long)k_tokens->ne[1], (long long)k_tokens->ne[2], (long long)k_tokens->ne[3]);
+    ggml_tensor * v_tokens = ggml_cont_4d(ctx, v, n_tokens, S_v, H_v, n_seqs);  // FIX: Use H_v not H_k!
+    fprintf(stderr, "[delta_net_recurrent] v_tokens: [%lld, %lld, %lld, %lld]\n",
+            (long long)v_tokens->ne[0], (long long)v_tokens->ne[1], (long long)v_tokens->ne[2], (long long)v_tokens->ne[3]);
+    ggml_tensor * g_tokens = ggml_cont_4d(ctx, g, n_tokens, 1, H_v, n_seqs);  // FIX: Use H_v not H_k!
+    ggml_tensor * beta_tokens = ggml_cont_4d(ctx, beta, n_tokens, 1, H_v, n_seqs);  // FIX: Use H_v not H_k!
 
-    state = ggml_cont_4d(ctx, state, S_v, S_v, H_k, n_seqs);
+    state = ggml_cont_4d(ctx, state, S_v, S_v, H_v, n_seqs);  // FIX: Use H_v not H_k!
+    fprintf(stderr, "[delta_net_recurrent] state: [%lld, %lld, %lld, %lld]\n",
+            (long long)state->ne[0], (long long)state->ne[1], (long long)state->ne[2], (long long)state->ne[3]);
     ggml_tensor * g_tokens_exp = ggml_exp(ctx, g_tokens);
 
     ggml_tensor * final_output = nullptr;
@@ -479,51 +522,159 @@ struct ggml_tensor * llm_build_qwen3next::delta_net_recurrent(
         } else {
             q_t = ggml_view_4d(ctx, q_tokens, 1, S_k, H_k, n_seqs, q_tokens->nb[1], q_tokens->nb[2], q_tokens->nb[3], i * ggml_element_size(q_tokens));
             k_t = ggml_view_4d(ctx, k_tokens, 1, S_k, H_k, n_seqs, k_tokens->nb[1], k_tokens->nb[2], k_tokens->nb[3], i * ggml_element_size(k_tokens));
-            v_t = ggml_view_4d(ctx, v_tokens, 1, S_v, H_k, n_seqs, v_tokens->nb[1], v_tokens->nb[2], v_tokens->nb[3], i * ggml_element_size(v_tokens));
-            g_t_exp = ggml_view_4d(ctx, g_tokens_exp, 1, 1, H_k, n_seqs, g_tokens_exp->nb[1], g_tokens_exp->nb[2], g_tokens_exp->nb[3], i * ggml_element_size(g_tokens_exp));
-            beta_t = ggml_view_4d(ctx, beta_tokens, 1, 1, H_k, n_seqs, beta_tokens->nb[1], beta_tokens->nb[2], beta_tokens->nb[3], i * ggml_element_size(beta_tokens));
+            v_t = ggml_view_4d(ctx, v_tokens, 1, S_v, H_v, n_seqs, v_tokens->nb[1], v_tokens->nb[2], v_tokens->nb[3], i * ggml_element_size(v_tokens));  // FIX: Use H_v not H_k!
+            g_t_exp = ggml_view_4d(ctx, g_tokens_exp, 1, 1, H_v, n_seqs, g_tokens_exp->nb[1], g_tokens_exp->nb[2], g_tokens_exp->nb[3], i * ggml_element_size(g_tokens_exp));  // FIX: Use H_v not H_k!
+            beta_t = ggml_view_4d(ctx, beta_tokens, 1, 1, H_v, n_seqs, beta_tokens->nb[1], beta_tokens->nb[2], beta_tokens->nb[3], i * ggml_element_size(beta_tokens));  // FIX: Use H_v not H_k!
         }
 
         // Apply gate to state: state = state * exp(g)
+        fprintf(stderr, "[delta_net_recurrent] Before gated_state - state: [%lld, %lld, %lld, %lld], g_t_exp: [%lld, %lld, %lld, %lld]\n",
+                (long long)state->ne[0], (long long)state->ne[1], (long long)state->ne[2], (long long)state->ne[3],
+                (long long)g_t_exp->ne[0], (long long)g_t_exp->ne[1], (long long)g_t_exp->ne[2], (long long)g_t_exp->ne[3]);
         ggml_tensor * gated_state = ggml_mul(ctx, state, g_t_exp);
         cb(gated_state, "gated_state", il);
 
         // Compute kv_memory from state and key
-        // kv_mem = (state * k.unsqueeze(-1)).sum(dim=-2)
-        
-        // Reshape gated_state from [S_v, S_v*H_v, 1, n_seqs] to [S_v, S_v, H_v, n_seqs]
-        // to make it compatible with k_expanded for element-wise multiplication
-        ggml_tensor * gated_state_reshaped = ggml_reshape_4d(ctx, gated_state, S_v, S_v, H_v, n_seqs);
-        cb(gated_state_reshaped, "gated_state_reshaped", il);
-        
-        ggml_tensor * state_k_product = ggml_mul(ctx, gated_state_reshaped, k_t);
-        cb(state_k_product, "state_k_product", il);
+        // kv_mem = (gated_state @ k_t).sum(dim=-2)
+        // gated_state: [S_v, S_v*H_v, 1, n_seqs] -> [S_v, S_v, H_v, n_seqs]
+        // k_t: [1, S_k, H_k, n_seqs]
+        // We need: state[S_v, S_v] @ k[S_v, 1] for each head -> output [S_v, 1] per head
 
-        ggml_tensor * kv_memory = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, state_k_product)));
+        // Reshape gated_state from [S_v, S_v*H_v, 1, n_seqs] to [S_v, S_v, H_v, n_seqs]
+        // Make gated_state contiguous BEFORE reshape (reshape requires contiguous input)
+        ggml_tensor * gated_state_reshaped = ggml_reshape_4d(ctx, ggml_cont(ctx, gated_state), S_v, S_v, H_v, n_seqs);
+        fprintf(stderr, "[delta_net_recurrent] gated_state_reshaped: [%lld, %lld, %lld, %lld]\n",
+                (long long)gated_state_reshaped->ne[0], (long long)gated_state_reshaped->ne[1], (long long)gated_state_reshaped->ne[2], (long long)gated_state_reshaped->ne[3]);
+        cb(gated_state_reshaped, "gated_state_reshaped", il);
+
+        // Reshape k_t from [1, S_k, H_k, n_seqs] to [S_k, 1, H_k, n_seqs] for matmul
+        fprintf(stderr, "[delta_net_recurrent] Before permute - k_t: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_t->ne[0], (long long)k_t->ne[1], (long long)k_t->ne[2], (long long)k_t->ne[3]);
+        ggml_tensor * k_t_reshaped = ggml_cont(ctx, ggml_permute(ctx, k_t, 1, 0, 2, 3));
+        fprintf(stderr, "[delta_net_recurrent] k_t_reshaped: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_t_reshaped->ne[0], (long long)k_t_reshaped->ne[1], (long long)k_t_reshaped->ne[2], (long long)k_t_reshaped->ne[3]);
+        cb(k_t_reshaped, "k_t_reshaped", il);
+
+        // Element-wise multiply + sum: state [S_v, S_v, H_v, n_seqs] * k [S_v, 1, H_v, n_seqs] -> sum over dim=1
+        // Reference PyTorch: (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        // Broadcast k_t_reshaped from [S_v, 1, H_v, n_seqs] to [S_v, S_v, H_v, n_seqs]
+        ggml_tensor * k_t_broadcast_for_mul = ggml_repeat(ctx, k_t_reshaped, gated_state_reshaped);
+        ggml_tensor * pointwise_kv = ggml_mul(ctx, gated_state_reshaped, k_t_broadcast_for_mul);
+        // Sum over dim=1 (the second S_v dimension corresponding to k_dim)
+        // ggml_sum_rows sums over dim=0, so we need to permute first
+        ggml_tensor * pointwise_kv_permuted = ggml_cont(ctx, ggml_permute(ctx, pointwise_kv, 1, 0, 2, 3));  // [S_v, S_v, H_v, n_seqs] -> [S_v, S_v, H_v, n_seqs] with dims swapped
+        ggml_tensor * kv_memory_permuted = ggml_sum_rows(ctx, pointwise_kv_permuted);  // [S_v, S_v, H_v, n_seqs] -> [1, S_v, H_v, n_seqs]
+        ggml_tensor * kv_memory = ggml_cont(ctx, ggml_permute(ctx, kv_memory_permuted, 1, 0, 2, 3));  // [1, S_v, H_v, n_seqs] -> [S_v, 1, H_v, n_seqs]
+        fprintf(stderr, "[delta_net_recurrent] kv_memory: [%lld, %lld, %lld, %lld]\n",
+                (long long)kv_memory->ne[0], (long long)kv_memory->ne[1], (long long)kv_memory->ne[2], (long long)kv_memory->ne[3]);
         cb(kv_memory, "kv_memory", il);
 
         // Compute delta = (v - kv_memory) * beta
-        ggml_tensor * v_diff = ggml_sub(ctx, v_t, kv_memory);
+        // v_t is [1, S_v, H_v, n_seqs] but kv_memory is [S_v, 1, H_v, n_seqs]
+        // Reshape v_t to [S_v, 1, H_v, n_seqs] to match kv_memory
+        // Make v_t contiguous BEFORE reshape (reshape requires contiguous input)
+        fprintf(stderr, "[delta_net_recurrent] Before v_diff - v_t: [%lld, %lld, %lld, %lld], kv_memory: [%lld, %lld, %lld, %lld]\n",
+                (long long)v_t->ne[0], (long long)v_t->ne[1], (long long)v_t->ne[2], (long long)v_t->ne[3],
+                (long long)kv_memory->ne[0], (long long)kv_memory->ne[1], (long long)kv_memory->ne[2], (long long)kv_memory->ne[3]);
+        ggml_tensor * v_t_reshaped = ggml_reshape_4d(ctx, ggml_cont(ctx, v_t), S_v, 1, H_v, n_seqs);
+        fprintf(stderr, "[delta_net_recurrent] v_t_reshaped: [%lld, %lld, %lld, %lld]\n",
+                (long long)v_t_reshaped->ne[0], (long long)v_t_reshaped->ne[1], (long long)v_t_reshaped->ne[2], (long long)v_t_reshaped->ne[3]);
+        ggml_tensor * v_diff = ggml_sub(ctx, v_t_reshaped, kv_memory);
+        fprintf(stderr, "[delta_net_recurrent] v_diff created: [%lld, %lld, %lld, %lld]\n",
+                (long long)v_diff->ne[0], (long long)v_diff->ne[1], (long long)v_diff->ne[2], (long long)v_diff->ne[3]);
+        cb(v_diff, "v_diff", il);
+
+        fprintf(stderr, "[delta_net_recurrent] Before delta_mul - v_diff: [%lld, %lld, %lld, %lld], beta_t: [%lld, %lld, %lld, %lld]\n",
+                (long long)v_diff->ne[0], (long long)v_diff->ne[1], (long long)v_diff->ne[2], (long long)v_diff->ne[3],
+                (long long)beta_t->ne[0], (long long)beta_t->ne[1], (long long)beta_t->ne[2], (long long)beta_t->ne[3]);
         ggml_tensor * delta = ggml_mul(ctx, v_diff, beta_t);
+        fprintf(stderr, "[delta_net_recurrent] delta created: [%lld, %lld, %lld, %lld]\n",
+                (long long)delta->ne[0], (long long)delta->ne[1], (long long)delta->ne[2], (long long)delta->ne[3]);
         cb(delta, "delta", il);
 
         // Update state = state + k * delta
         // In the reference: last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        ggml_tensor * delta_t = ggml_transpose(ctx, delta);
+        // This is an OUTER PRODUCT: k_t [S_v, 1] and delta [1, S_v] -> [S_v, S_v]
 
-        // Will need to broadcast here since GGML doesn't support auto-double-broadcasting on mul
-        ggml_tensor * delta_t_broadcast = ggml_repeat_4d(ctx, delta_t, S_v, S_v, H_v, n_seqs);
-        ggml_tensor * k_t_broadcast  = ggml_repeat_4d(ctx, k_t, S_v, S_v, H_v, n_seqs);
+        // k_t_reshaped is [S_v, 1, H_v, n_seqs] - acts like k_t.unsqueeze(-1) in PyTorch
+        // delta is [S_v, 1, H_v, n_seqs] - needs transpose to [1, S_v, H_v, n_seqs] to act like delta.unsqueeze(-2)
+
+        fprintf(stderr, "[delta_net_recurrent] Before transpose - delta: [%lld, %lld, %lld, %lld]\n",
+                (long long)delta->ne[0], (long long)delta->ne[1], (long long)delta->ne[2], (long long)delta->ne[3]);
+        ggml_tensor * delta_t = ggml_cont(ctx, ggml_transpose(ctx, delta));
+        fprintf(stderr, "[delta_net_recurrent] After transpose - delta_t: [%lld, %lld, %lld, %lld]\n",
+                (long long)delta_t->ne[0], (long long)delta_t->ne[1], (long long)delta_t->ne[2], (long long)delta_t->ne[3]);
+
+        // Create target tensor with final shape for proper broadcasting
+        ggml_tensor * target_shape = ggml_new_tensor_4d(ctx, k_t_reshaped->type, S_v, S_v, H_v, n_seqs);
+
+        // Broadcast k_t_reshaped: [S_v, 1, H_v, n_seqs] -> [S_v, S_v, H_v, n_seqs]
+        // This repeats k_t along dimension 1 (second dimension)
+        fprintf(stderr, "[delta_net_recurrent] Broadcasting k_t: [%lld, %lld, %lld, %lld] -> [%lld, %lld, %lld, %lld]\n",
+                (long long)k_t_reshaped->ne[0], (long long)k_t_reshaped->ne[1], (long long)k_t_reshaped->ne[2], (long long)k_t_reshaped->ne[3],
+                (long long)S_v, (long long)S_v, (long long)H_v, (long long)n_seqs);
+        ggml_tensor * k_t_broadcast = ggml_repeat(ctx, k_t_reshaped, target_shape);
+        fprintf(stderr, "[delta_net_recurrent] k_t_broadcast created: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_t_broadcast->ne[0], (long long)k_t_broadcast->ne[1], (long long)k_t_broadcast->ne[2], (long long)k_t_broadcast->ne[3]);
+        cb(k_t_broadcast, "k_t_broadcast", il);
+
+        // Broadcast delta_t: [1, S_v, H_v, n_seqs] -> [S_v, S_v, H_v, n_seqs]
+        // This repeats delta_t along dimension 0 (first dimension)
+        fprintf(stderr, "[delta_net_recurrent] Broadcasting delta_t: [%lld, %lld, %lld, %lld] -> [%lld, %lld, %lld, %lld]\n",
+                (long long)delta_t->ne[0], (long long)delta_t->ne[1], (long long)delta_t->ne[2], (long long)delta_t->ne[3],
+                (long long)S_v, (long long)S_v, (long long)H_v, (long long)n_seqs);
+        ggml_tensor * delta_t_broadcast = ggml_repeat(ctx, delta_t, target_shape);
+        fprintf(stderr, "[delta_net_recurrent] delta_t_broadcast created: [%lld, %lld, %lld, %lld]\n",
+                (long long)delta_t_broadcast->ne[0], (long long)delta_t_broadcast->ne[1], (long long)delta_t_broadcast->ne[2], (long long)delta_t_broadcast->ne[3]);
+        cb(delta_t_broadcast, "delta_t_broadcast", il);
+
+        // Now multiply: k_t[i,j] * delta_t[i,j] creates the outer product
+        fprintf(stderr, "[delta_net_recurrent] Before k_delta_mul - k_t_broadcast: [%lld, %lld, %lld, %lld], delta_t_broadcast: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_t_broadcast->ne[0], (long long)k_t_broadcast->ne[1], (long long)k_t_broadcast->ne[2], (long long)k_t_broadcast->ne[3],
+                (long long)delta_t_broadcast->ne[0], (long long)delta_t_broadcast->ne[1], (long long)delta_t_broadcast->ne[2], (long long)delta_t_broadcast->ne[3]);
         ggml_tensor * k_delta_product = ggml_mul(ctx, k_t_broadcast, delta_t_broadcast);
+        fprintf(stderr, "[delta_net_recurrent] k_delta_product created: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_delta_product->ne[0], (long long)k_delta_product->ne[1], (long long)k_delta_product->ne[2], (long long)k_delta_product->ne[3]);
         cb(k_delta_product, "k_delta", il);
 
+        fprintf(stderr, "[delta_net_recurrent] Before state_add - gated_state_reshaped: [%lld, %lld, %lld, %lld], k_delta_product: [%lld, %lld, %lld, %lld]\n",
+                (long long)gated_state_reshaped->ne[0], (long long)gated_state_reshaped->ne[1], (long long)gated_state_reshaped->ne[2], (long long)gated_state_reshaped->ne[3],
+                (long long)k_delta_product->ne[0], (long long)k_delta_product->ne[1], (long long)k_delta_product->ne[2], (long long)k_delta_product->ne[3]);
         state = ggml_add(ctx, gated_state_reshaped, k_delta_product);
+        fprintf(stderr, "[delta_net_recurrent] updated_state created: [%lld, %lld, %lld, %lld]\n",
+                (long long)state->ne[0], (long long)state->ne[1], (long long)state->ne[2], (long long)state->ne[3]);
         cb(state, "updated_state", il);
 
-        ggml_tensor * state_q_product = ggml_mul(ctx, state, q_t);
-        cb(state_q_product, "state_q_product", il);
-        
-        ggml_tensor * output = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, state_q_product)));
+        // Compute output: output = (state @ q_t).sum(dim=-2)
+        // state: [S_v, S_v, H_v, n_seqs]
+        // q_t: [1, S_k, H_k, n_seqs]
+        // We need: state[S_v, S_v] @ q[S_v, 1] for each head -> output [S_v, 1] per head
+
+        // Reshape q_t from [1, S_k, H_k, n_seqs] to [S_k, 1, H_k, n_seqs] for matmul
+        fprintf(stderr, "[delta_net_recurrent] Before q_t_permute - q_t: [%lld, %lld, %lld, %lld]\n",
+                (long long)q_t->ne[0], (long long)q_t->ne[1], (long long)q_t->ne[2], (long long)q_t->ne[3]);
+        ggml_tensor * q_t_reshaped = ggml_cont(ctx, ggml_permute(ctx, q_t, 1, 0, 2, 3));
+        fprintf(stderr, "[delta_net_recurrent] q_t_reshaped: [%lld, %lld, %lld, %lld]\n",
+                (long long)q_t_reshaped->ne[0], (long long)q_t_reshaped->ne[1], (long long)q_t_reshaped->ne[2], (long long)q_t_reshaped->ne[3]);
+        cb(q_t_reshaped, "q_t_reshaped", il);
+
+        // Element-wise multiply + sum: state [S_v, S_v, H_v, n_seqs] * q [S_v, 1, H_v, n_seqs] -> sum over dim=1
+        // Reference PyTorch: (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        // Make state contiguous first (it comes from ggml_add which may not be contiguous)
+        fprintf(stderr, "[delta_net_recurrent] Before output_matmul - state: [%lld, %lld, %lld, %lld], q_t_reshaped: [%lld, %lld, %lld, %lld]\n",
+                (long long)state->ne[0], (long long)state->ne[1], (long long)state->ne[2], (long long)state->ne[3],
+                (long long)q_t_reshaped->ne[0], (long long)q_t_reshaped->ne[1], (long long)q_t_reshaped->ne[2], (long long)q_t_reshaped->ne[3]);
+        ggml_tensor * state_cont = ggml_cont(ctx, state);
+        // Broadcast q_t_reshaped from [S_v, 1, H_v, n_seqs] to [S_v, S_v, H_v, n_seqs]
+        ggml_tensor * q_t_broadcast_for_mul = ggml_repeat(ctx, q_t_reshaped, state_cont);
+        ggml_tensor * pointwise_out = ggml_mul(ctx, state_cont, q_t_broadcast_for_mul);
+        // Sum over dim=1 (the second S_v dimension corresponding to k_dim)
+        // ggml_sum_rows sums over dim=0, so we need to permute first to swap dims 0 and 1
+        ggml_tensor * pointwise_out_permuted = ggml_cont(ctx, ggml_permute(ctx, pointwise_out, 1, 0, 2, 3));  // [S_v, S_v, H_v, n_seqs] -> [S_v, S_v, H_v, n_seqs] with dims swapped
+        ggml_tensor * output_permuted = ggml_sum_rows(ctx, pointwise_out_permuted);  // [S_v, S_v, H_v, n_seqs] -> [1, S_v, H_v, n_seqs]
+        ggml_tensor * output = ggml_cont(ctx, ggml_permute(ctx, output_permuted, 1, 0, 2, 3));  // [1, S_v, H_v, n_seqs] -> [S_v, 1, H_v, n_seqs]
+        fprintf(stderr, "[delta_net_recurrent] output created: [%lld, %lld, %lld, %lld]\n",
+                (long long)output->ne[0], (long long)output->ne[1], (long long)output->ne[2], (long long)output->ne[3]);
         cb(output, "output", il);
 
         if (final_output == nullptr) {
@@ -747,11 +898,30 @@ ggml_tensor * llm_build_qwen3next::build_qwen3next_linear_attn_layer(llm_graph_i
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     if (num_k_heads != num_v_heads) {
+        fprintf(stderr, "[build_linear_attn] GQA: num_k_heads=%lld != num_v_heads=%lld, repeating...\n",
+                (long long)num_k_heads, (long long)num_v_heads);
+        fprintf(stderr, "[build_linear_attn] Before repeat - q_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)q_conv->ne[0], (long long)q_conv->ne[1], (long long)q_conv->ne[2], (long long)q_conv->ne[3]);
+        fprintf(stderr, "[build_linear_attn] Before repeat - k_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_conv->ne[0], (long long)k_conv->ne[1], (long long)k_conv->ne[2], (long long)k_conv->ne[3]);
+
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         int64_t repeat_factor = num_v_heads / num_k_heads;
 
+        // Repeat q and k to match the number of v heads
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_k_heads * repeat_factor, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_k_heads * repeat_factor, n_seq_tokens, n_seqs);
+
+        fprintf(stderr, "[build_linear_attn] After repeat - q_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)q_conv->ne[0], (long long)q_conv->ne[1], (long long)q_conv->ne[2], (long long)q_conv->ne[3]);
+        fprintf(stderr, "[build_linear_attn] After repeat - k_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_conv->ne[0], (long long)k_conv->ne[1], (long long)k_conv->ne[2], (long long)k_conv->ne[3]);
+
+        // Note: gate is already in the correct shape [num_v_heads, n_tokens, n_seqs, 1] from line 620
+        // beta also already matches num_v_heads from line 753
+        // state needs to be reshaped to account for the repeated heads
+        // Original state: [head_v_dim, head_v_dim * num_v_heads, 1, n_seqs]
+        // This is already correct since it uses num_v_heads, not num_k_heads
     }
 
     cb(q_conv, "q_conv_predelta", il);
@@ -761,6 +931,13 @@ ggml_tensor * llm_build_qwen3next::build_qwen3next_linear_attn_layer(llm_graph_i
     // Choose between delta_net and delta_net_recurrent based on generation mode
     ggml_tensor * attn_out;
     if (is_generation) {
+        fprintf(stderr, "[build_linear_attn] Calling delta_net_recurrent with:\n");
+        fprintf(stderr, "[build_linear_attn]   q_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)q_conv->ne[0], (long long)q_conv->ne[1], (long long)q_conv->ne[2], (long long)q_conv->ne[3]);
+        fprintf(stderr, "[build_linear_attn]   k_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)k_conv->ne[0], (long long)k_conv->ne[1], (long long)k_conv->ne[2], (long long)k_conv->ne[3]);
+        fprintf(stderr, "[build_linear_attn]   v_conv: [%lld, %lld, %lld, %lld]\n",
+                (long long)v_conv->ne[0], (long long)v_conv->ne[1], (long long)v_conv->ne[2], (long long)v_conv->ne[3]);
         // Use delta_net_recurrent for single token generation
         attn_out = delta_net_recurrent(ctx0, q_conv, k_conv, v_conv, gate, beta, state, true, hparams.f_norm_rms_eps, il);
     } else {
