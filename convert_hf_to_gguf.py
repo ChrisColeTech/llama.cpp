@@ -2348,6 +2348,25 @@ class LlamaModel(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("MobileLLMP1ForCausalLM")
+class MobileLLMModel(LlamaModel):
+    model_arch = gguf.MODEL_ARCH.LLAMA4
+    undo_permute = False
+
+    def set_vocab(self):
+        # MobileLLM uses GPT2 tokenizer, not SentencePiece
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # MobileLLM uses llama4 architecture but without MoE
+        # The MoE parameters are now optional in llama.cpp (patched)
+
+        # Set sliding window based on config
+        if "sliding_window" in self.hparams:
+            self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
+
+
 @ModelBase.register("ArceeForCausalLM")
 class ArceeModel(LlamaModel):
     model_arch = gguf.MODEL_ARCH.ARCEE

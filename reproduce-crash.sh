@@ -4,13 +4,13 @@
 
 set -e
 
-SERVER_LOG="/mnt/c/Projects/llama.cpp-v2/logs/reproduce-crash.log"
-TEST_LOG="/mnt/c/Projects/llama.cpp-v2/logs/test-output.log"
-SERVER_BIN="/mnt/c/Projects/llama.cpp-v2/build/bin/llama-server"
+SERVER_LOG="/mnt/d/Projects/llama.cpp/logs/reproduce-crash.log"
+TEST_LOG="/mnt/d/Projects/llama.cpp/logs/test-output.log"
+SERVER_BIN="/mnt/d/Projects/llama.cpp/build/bin/llama-server"
 MODEL_PATH="/mnt/d/Projects/qwen_quant/converted/q3/qwen3_80b-Q3_K_M.gguf"
 
 # Create logs directory if it doesn't exist
-mkdir -p "/mnt/c/Projects/llama.cpp-v2/logs"
+mkdir -p "/mnt/d/Projects/llama.cpp/logs"
 
 echo "====================================================="
 echo "DeltaNet Crash Reproduction Script (Linux)"
