@@ -525,15 +525,20 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
         {
             uint32_t n_dims = 0;
             ok = ok && gr.read(n_dims);
+
+            // Support for 5D tensors (e.g., VAE tensors from diffusion models)
+            // We collapse dims 4+ into dim 3 to fit within GGML_MAX_DIMS
+            uint32_t original_n_dims = n_dims;
+            int64_t extra_dims_product = 1;
+
             if (n_dims > GGML_MAX_DIMS) {
-                GGML_LOG_ERROR("%s: tensor '%s' has invalid number of dimensions: %" PRIu32 " > %" PRIu32 "\n",
-                    __func__, info.t.name, n_dims, GGML_MAX_DIMS);
-                ok = false;
-                break;
+                GGML_LOG_WARN("%s: tensor '%s' has %" PRIu32 " dimensions (> %" PRIu32 "), collapsing extra dims into dim %d\n",
+                    __func__, info.t.name, n_dims, GGML_MAX_DIMS, GGML_MAX_DIMS - 1);
             }
+
             for (uint32_t j = 0; ok && j < GGML_MAX_DIMS; ++j) {
                 info.t.ne[j] = 1;
-                if (j < n_dims) {
+                if (j < n_dims && j < GGML_MAX_DIMS) {
                     ok = ok && gr.read(info.t.ne[j]);
                 }
 
@@ -544,6 +549,26 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                     ok = false;
                     break;
                 }
+            }
+
+            // Read and collapse any extra dimensions beyond GGML_MAX_DIMS
+            for (uint32_t j = GGML_MAX_DIMS; ok && j < original_n_dims; ++j) {
+                int64_t extra_dim = 1;
+                ok = ok && gr.read(extra_dim);
+                if (extra_dim < 0) {
+                    GGML_LOG_ERROR("%s: tensor '%s' dimension %" PRIu32 " has invalid number of elements: %" PRIi64 " < 0\n",
+                        __func__, info.t.name, j, extra_dim);
+                    ok = false;
+                    break;
+                }
+                extra_dims_product *= extra_dim;
+            }
+
+            // Collapse extra dimensions into the last dimension
+            if (original_n_dims > GGML_MAX_DIMS && extra_dims_product > 1) {
+                info.t.ne[GGML_MAX_DIMS - 1] *= extra_dims_product;
+                GGML_LOG_WARN("%s: tensor '%s' extra dims collapsed, new shape: [%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 "]\n",
+                    __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3]);
             }
 
             // check that the total number of elements is representable

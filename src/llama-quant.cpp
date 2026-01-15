@@ -175,6 +175,113 @@ static void llama_tensor_dequantize_impl(
     workers.clear();
 }
 
+// Special function for quantizing image/diffusion model tensors
+static ggml_type img_tensor_get_type(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
+    // QK_K is the block size for K-quant types (Q2_K through Q6_K)
+    // Defined in ggml-common.h but we define locally to avoid header dependencies
+    constexpr int QK_K = 256;
+
+    const std::string name = ggml_get_name(tensor);
+    const llm_arch arch = qs.model.arch;
+
+    // No sanity check needed - diffusion models have various naming conventions
+    // LTX-2 uses: model.diffusion_model.transformer_blocks.X.attn1.to_k.weight
+    // Flux uses: double_blocks.X.img_attn.qkv.weight
+    // SD/SDXL use: model.diffusion_model.input_blocks.X...
+
+    // Rules for to_v attention - keep higher precision
+    if (
+            (name.find("attn_v.weight") != std::string::npos) ||
+            (name.find(".to_v.weight") != std::string::npos) ||
+            (name.find(".v.weight") != std::string::npos) ||
+            (name.find(".attn.w1v.weight") != std::string::npos) ||
+            (name.find(".attn.w2v.weight") != std::string::npos) ||
+            (name.find("_attn.v_proj.weight") != std::string::npos)
+        ){
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) {
+                new_type = GGML_TYPE_Q3_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
+                new_type = qs.i_attention_wv < 2 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
+                new_type = GGML_TYPE_Q6_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && qs.i_attention_wv < 4) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+            ++qs.i_attention_wv;
+    } else if ( // Rules for fused qkv attention
+            (name.find("attn_qkv.weight") != std::string::npos) ||
+            (name.find("attn.qkv.weight") != std::string::npos) ||
+            (name.find("attention.qkv.weight") != std::string::npos)
+        ) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
+                new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
+                new_type = GGML_TYPE_Q6_K;
+            }
+    } else if ( // Rules for ffn
+            (name.find("ffn_down") != std::string::npos) ||
+            ((name.find("experts.") != std::string::npos) && (name.find(".w2.weight") != std::string::npos)) ||
+            (name.find(".ffn.2.weight") != std::string::npos) ||
+            (name.find(".ff.net.2.weight") != std::string::npos) ||
+            (name.find(".mlp.layer2.weight") != std::string::npos) ||
+            (name.find(".adaln_modulation_mlp.2.weight") != std::string::npos) ||
+            (name.find(".feed_forward.w2.weight") != std::string::npos)
+        ) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
+                new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
+                new_type = GGML_TYPE_Q6_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
+                new_type = GGML_TYPE_Q6_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_0) {
+                new_type = GGML_TYPE_Q4_1;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_0) {
+                new_type = GGML_TYPE_Q5_1;
+            }
+            ++qs.i_ffn_down;
+    }
+
+    // Sanity check for row shape - Q*_K types need dims divisible by 256
+    bool convert_incompatible_tensor = false;
+    if (new_type == GGML_TYPE_Q2_K    || new_type == GGML_TYPE_Q3_K    || new_type == GGML_TYPE_Q4_K   ||
+        new_type == GGML_TYPE_Q5_K    || new_type == GGML_TYPE_Q6_K) {
+        int nx = tensor->ne[0];
+        int ny = tensor->ne[1];
+        if (nx % QK_K != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, QK_K, ggml_type_name(new_type));
+            convert_incompatible_tensor = true;
+        } else {
+            ++qs.n_k_quantized;
+        }
+    }
+    if (convert_incompatible_tensor) {
+        new_type = GGML_TYPE_F16;
+        LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
+        ++qs.n_fallback;
+    }
+    return new_type;
+}
+
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
     const std::string name = ggml_get_name(tensor);
 
@@ -820,6 +927,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // do not quantize norm tensors
         quantize &= name.find("_norm.weight") == std::string::npos;
 
+        // do not quantize VAE tensors (from diffusion models like LTX, etc.)
+        // These may have been 5D tensors that were collapsed during loading
+        quantize &= name.find("vae.") == std::string::npos;
+        quantize &= name.find("first_stage_model.") == std::string::npos;
+
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
 
@@ -863,6 +975,117 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // do not quantize relative position bias (T5)
         quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
+        // rules for diffusion/image models
+        bool image_model = false;
+        if (model.arch == LLM_ARCH_FLUX) {
+            image_model = true;
+            quantize &= name.find("txt_in.") == std::string::npos;
+            quantize &= name.find("img_in.") == std::string::npos;
+            quantize &= name.find("time_in.") == std::string::npos;
+            quantize &= name.find("vector_in.") == std::string::npos;
+            quantize &= name.find("guidance_in.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_SD1 || model.arch == LLM_ARCH_SDXL) {
+            image_model = true;
+            quantize &= name.find("class_embedding.") == std::string::npos;
+            quantize &= name.find("time_embedding.") == std::string::npos;
+            quantize &= name.find("add_embedding.") == std::string::npos;
+            quantize &= name.find("time_embed.") == std::string::npos;
+            quantize &= name.find("label_emb.") == std::string::npos;
+            quantize &= name.find("conv_in.") == std::string::npos;
+            quantize &= name.find("conv_out.") == std::string::npos;
+            quantize &= name != "input_blocks.0.0.weight";
+            quantize &= name != "out.2.weight";
+        }
+        if (model.arch == LLM_ARCH_SD3) {
+            image_model = true;
+            quantize &= name.find("final_layer.") == std::string::npos;
+            quantize &= name.find("time_text_embed.") == std::string::npos;
+            quantize &= name.find("context_embedder.") == std::string::npos;
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("y_embedder.") == std::string::npos;
+            quantize &= name.find("x_embedder.") == std::string::npos;
+            quantize &= name != "proj_out.weight";
+            quantize &= name != "pos_embed";
+        }
+        if (model.arch == LLM_ARCH_AURA) {
+            image_model = true;
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("init_x_linear.") == std::string::npos;
+            quantize &= name != "modF.1.weight";
+            quantize &= name != "cond_seq_linear.weight";
+            quantize &= name != "final_linear.weight";
+            quantize &= name != "positional_encoding";
+            quantize &= name != "register_tokens";
+        }
+        if (model.arch == LLM_ARCH_LTXV || model.arch == LLM_ARCH_LTX2) {
+            image_model = true;
+            quantize &= name.find("adaln_single.") == std::string::npos;
+            quantize &= name.find("caption_projection.") == std::string::npos;
+            quantize &= name.find("patchify_proj.") == std::string::npos;
+            quantize &= name.find("proj_out.") == std::string::npos;
+            quantize &= name.find("scale_shift_table") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_HYVID) {
+            image_model = true;
+            quantize &= name.find("txt_in.") == std::string::npos;
+            quantize &= name.find("img_in.") == std::string::npos;
+            quantize &= name.find("time_in.") == std::string::npos;
+            quantize &= name.find("vector_in.") == std::string::npos;
+            quantize &= name.find("guidance_in.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_WAN) {
+            image_model = true;
+            quantize &= name.find("modulation.") == std::string::npos;
+            quantize &= name.find("patch_embedding.") == std::string::npos;
+            quantize &= name.find("text_embedding.") == std::string::npos;
+            quantize &= name.find("time_projection.") == std::string::npos;
+            quantize &= name.find("time_embedding.") == std::string::npos;
+            quantize &= name.find("img_emb.") == std::string::npos;
+            quantize &= name.find("head.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_HIDREAM) {
+            image_model = true;
+            quantize &= name.find("p_embedder.") == std::string::npos;
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("x_embedder.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+            quantize &= name.find(".ff_i.gate.weight") == std::string::npos;
+            quantize &= name.find("caption_projection.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_COSMOS) {
+            image_model = true;
+            quantize &= name.find("p_embedder.") == std::string::npos;
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("t_embedding_norm.") == std::string::npos;
+            quantize &= name.find("x_embedder.") == std::string::npos;
+            quantize &= name.find("pos_embedder.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_LUMINA2) {
+            image_model = true;
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("x_embedder.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+            quantize &= name.find("cap_embedder.") == std::string::npos;
+            quantize &= name.find("context_refiner.") == std::string::npos;
+            quantize &= name.find("noise_refiner.") == std::string::npos;
+        }
+        if (model.arch == LLM_ARCH_QWENIMAGE || model.arch == LLM_ARCH_ZIMAGE) {
+            image_model = true;
+            // Similar to Lumina2/Flux patterns
+            quantize &= name.find("t_embedder.") == std::string::npos;
+            quantize &= name.find("x_embedder.") == std::string::npos;
+            quantize &= name.find("final_layer.") == std::string::npos;
+            quantize &= name.find("context_embedder.") == std::string::npos;
+        }
+        // ignore 3D/4D tensors for image models as the code was never meant to handle these
+        if (image_model) {
+            quantize &= ggml_n_dims(tensor) == 2;
+        }
+
         // do not quantize specific multimodal tensors
         quantize &= name.find(".position_embd.") == std::string::npos;
 
@@ -876,7 +1099,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (!params->pure && ggml_is_quantized(default_type)) {
                 int fallback = qs.n_fallback;
-                new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
+                // Use image-specific quantization for diffusion models
+                if (image_model) {
+                    new_type = img_tensor_get_type(qs, new_type, tensor, ftype);
+                } else {
+                    new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
+                }
                 // unless the user specifies a type, and the tensor geometry will not require fallback quantisation
                 if (params->tensor_types && qs.n_fallback - fallback == 0) {
                     const std::vector<tensor_quantization> & tensor_types = *static_cast<const std::vector<tensor_quantization> *>(params->tensor_types);

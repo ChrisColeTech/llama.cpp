@@ -120,6 +120,21 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MIMO2,            "mimo2"           },
     { LLM_ARCH_LLAMA_EMBED,      "llama-embed"      },
     { LLM_ARCH_MAINCODER,        "maincoder"        },
+    // Diffusion models
+    { LLM_ARCH_FLUX,             "flux"             },
+    { LLM_ARCH_SD1,              "sd1"              },
+    { LLM_ARCH_SDXL,             "sdxl"             },
+    { LLM_ARCH_SD3,              "sd3"              },
+    { LLM_ARCH_AURA,             "aura"             },
+    { LLM_ARCH_LTXV,             "ltxv"             },
+    { LLM_ARCH_LTX2,             "ltx2"             },
+    { LLM_ARCH_HYVID,            "hyvid"            },
+    { LLM_ARCH_WAN,              "wan"              },
+    { LLM_ARCH_HIDREAM,          "hidream"          },
+    { LLM_ARCH_COSMOS,           "cosmos"           },
+    { LLM_ARCH_LUMINA2,          "lumina2"          },
+    { LLM_ARCH_QWENIMAGE,        "qwen_image"       },
+    { LLM_ARCH_ZIMAGE,           "zimage"           },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -2289,6 +2304,22 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_FFN_DOWN,
                 LLM_TENSOR_FFN_UP,
             };
+        // Diffusion models - empty tensor mappings
+        case LLM_ARCH_FLUX:
+        case LLM_ARCH_SD1:
+        case LLM_ARCH_SDXL:
+        case LLM_ARCH_SD3:
+        case LLM_ARCH_AURA:
+        case LLM_ARCH_LTXV:
+        case LLM_ARCH_LTX2:
+        case LLM_ARCH_HYVID:
+        case LLM_ARCH_WAN:
+        case LLM_ARCH_HIDREAM:
+        case LLM_ARCH_COSMOS:
+        case LLM_ARCH_LUMINA2:
+        case LLM_ARCH_QWENIMAGE:
+        case LLM_ARCH_ZIMAGE:
+            return {};
         default:
             GGML_ABORT("unknown architecture for tensor mapping");
     }

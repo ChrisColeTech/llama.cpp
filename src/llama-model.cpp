@@ -505,8 +505,30 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
+    // Diffusion models also skip hparams loading
     if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {
         return;
+    }
+
+    // Skip hparams for diffusion models
+    switch (ml.get_arch()) {
+        case LLM_ARCH_FLUX:
+        case LLM_ARCH_SD1:
+        case LLM_ARCH_SDXL:
+        case LLM_ARCH_SD3:
+        case LLM_ARCH_AURA:
+        case LLM_ARCH_LTXV:
+        case LLM_ARCH_LTX2:
+        case LLM_ARCH_HYVID:
+        case LLM_ARCH_WAN:
+        case LLM_ARCH_HIDREAM:
+        case LLM_ARCH_COSMOS:
+        case LLM_ARCH_LUMINA2:
+        case LLM_ARCH_QWENIMAGE:
+        case LLM_ARCH_ZIMAGE:
+            return;
+        default:
+            break;
     }
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
